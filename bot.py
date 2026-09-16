@@ -6,7 +6,7 @@ from zoneinfo import ZoneInfo
 from telegram import Update
 from telegram.constants import ChatMemberStatus
 from telegram.ext import (
-    Application, CommandHandler, MessageHandler, ContextTypes, filters
+    Application, ChatMemberHandler, CommandHandler, MessageHandler, ContextTypes, filters
 )
 
 TOKEN = os.getenv("BOT_TOKEN")
