@@ -290,7 +290,7 @@ def main():
     app.add_handler(CommandHandler("groups", groups))
     app.add_handler(CommandHandler("broadcast", broadcast))
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & ~filters.COMMAND, track_message))
-    app.add_handler(MessageHandler(filters.StatusUpdate.MY_CHAT_MEMBER, my_chat_member))
+    app.add_handler(ChatMemberHandler(my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
     app.add_error_handler(error_handler)
 
     # Runs daily at 23:59 IST. It announces the day that just ended.
