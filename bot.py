@@ -3,14 +3,23 @@ import sqlite3
 import logging
 from datetime import datetime, timedelta, time
 from zoneinfo import ZoneInfo
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from threading import Thread
 
-from telegram import Update
+from telegram import (
+    Update,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
 from telegram.constants import ChatMemberStatus
 from telegram.ext import (
     Application,
-    ChatMemberHandler,
     CommandHandler,
     MessageHandler,
+    CallbackQueryHandler,
+    ChatMemberHandler,
     ContextTypes,
     filters,
 )
@@ -21,20 +30,15 @@ DB_PATH = os.getenv("DB_PATH", "chat_manager.db")
 TZ = ZoneInfo("Asia/Kolkata")
 UTC = ZoneInfo("UTC")
 
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-)
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 if not TOKEN:
-    raise RuntimeError("BOT_TOKEN environment variable is required.")
+    raise RuntimeError("BOT_TOKEN environment variable is required")
 
 
 def db():
     conn = sqlite3.connect(DB_PATH, timeout=30)
-    conn.execute("PRAGMA journal_mode=WAL")
-
     conn.execute("""
         CREATE TABLE IF NOT EXISTS messages (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -45,30 +49,18 @@ def db():
             ts TEXT NOT NULL
         )
     """)
-
     conn.execute("""
         CREATE TABLE IF NOT EXISTS groups (
             chat_id INTEGER PRIMARY KEY,
             title TEXT,
-            active INTEGER NOT NULL DEFAULT 1
+            active INTEGER DEFAULT 1
         )
     """)
-
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS awards (
-            chat_id INTEGER NOT NULL,
-            award_type TEXT NOT NULL,
-            period_key TEXT NOT NULL,
-            sent_at TEXT NOT NULL,
-            PRIMARY KEY (chat_id, award_type, period_key)
-        )
-    """)
-
     conn.commit()
     return conn
 
 
-def local_now():
+def now():
     return datetime.now(TZ)
 
 
@@ -78,514 +70,415 @@ def iso(dt):
 
 def register_group(chat_id, title):
     conn = db()
-    conn.execute(
-        "INSERT INTO groups(chat_id, title, active) VALUES(?,?,1) "
-        "ON CONFLICT(chat_id) DO UPDATE SET "
-        "title=excluded.title, active=1",
-        (chat_id, title or ""),
-    )
+    conn.execute("""
+        INSERT INTO groups(chat_id, title, active)
+        VALUES (?, ?, 1)
+        ON CONFLICT(chat_id)
+        DO UPDATE SET title=excluded.title, active=1
+    """, (chat_id, title or "Telegram Group"))
     conn.commit()
     conn.close()
 
 
-def leaderboard(chat_id, start, end=None, limit=10):
+def active_groups():
     conn = db()
-
-    query = """
-        SELECT user_id,
-               COALESCE(
-                   NULLIF(username,''),
-                   NULLIF(first_name,''),
-                   'Member'
-               ) AS name,
-               COUNT(*) AS total
-        FROM messages
-        WHERE chat_id=? AND ts>=?
-    """
-
-    args = [chat_id, iso(start)]
-
-    if end is not None:
-        query += " AND ts<?"
-        args.append(iso(end))
-
-    query += (
-        " GROUP BY user_id "
-        "ORDER BY total DESC, user_id ASC LIMIT ?"
-    )
-    args.append(limit)
-
-    rows = conn.execute(query, args).fetchall()
+    rows = conn.execute(
+        "SELECT chat_id, title FROM groups WHERE active=1 ORDER BY title"
+    ).fetchall()
     conn.close()
     return rows
 
 
-def escape_html(value):
-    return (
-        str(value or "Member")
-        .replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-        .replace('"', "&quot;")
+def keyboard():
+    return ReplyKeyboardMarkup(
+        [
+            [KeyboardButton("📅 Daily Ranking"),
+             KeyboardButton("🗓 Weekly Ranking")],
+            [KeyboardButton("👑 Overall Ranking")]
+        ],
+        resize_keyboard=True,
+        is_persistent=True,
+        input_field_placeholder="Choose your ranking..."
     )
 
 
-def format_name(user_id, name):
-    return (
-        f'<a href="tg://user?id={user_id}">'
-        f'{escape_html(name)}</a>'
+def group_keyboard():
+    rows = [
+        [InlineKeyboardButton(
+            (title or "Telegram Group")[:40],
+            callback_data=f"pick:{chat_id}"
+        )]
+        for chat_id, title in active_groups()
+    ]
+    return InlineKeyboardMarkup(rows) if rows else None
+
+
+def bounds(kind):
+    current = now()
+    today = datetime.combine(
+        current.date(), time.min, tzinfo=TZ
     )
 
+    if kind == "daily":
+        return today, today + timedelta(days=1)
 
-async def track_message(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
+    if kind == "weekly":
+        monday = today - timedelta(days=current.weekday())
+        return monday, monday + timedelta(days=7)
+
+    return datetime(1970, 1, 1, tzinfo=TZ), None
+
+
+def ranking(chat_id, kind, user_id):
+    start, end = bounds(kind)
+
+    conn = db()
+    sql = """
+        SELECT user_id,
+        COALESCE(NULLIF(username,''), NULLIF(first_name,''), 'Member'),
+        COUNT(*) AS total
+        FROM messages
+        WHERE chat_id=? AND ts>=?
+    """
+    args = [chat_id, iso(start)]
+
+    if end:
+        sql += " AND ts<?"
+        args.append(iso(end))
+
+    sql += " GROUP BY user_id ORDER BY total DESC, user_id ASC"
+    rows = conn.execute(sql, args).fetchall()
+    conn.close()
+
+    titles = {
+        "daily": "📅 DAILY RANKING",
+        "weekly": "🗓 WEEKLY RANKING",
+        "overall": "👑 OVERALL LIFETIME RANKING"
+    }
+
+    lines = [f"<b>{titles[kind]}</b>", "━━━━━━━━━━━━━━"]
+
+    if not rows:
+        lines.append("Abhi koi messages record nahi hue.")
+    else:
+        medals = ["🥇", "🥈", "🥉"]
+
+        for position, (uid, name, count) in enumerate(rows[:10], 1):
+            medal = medals[position - 1] if position <= 3 else f"{position}."
+            safe_name = (
+                str(name).replace("&", "&amp;")
+                .replace("<", "&lt;")
+                .replace(">", "&gt;")
+            )
+            lines.append(
+                f"{medal} <a href='tg://user?id={uid}'>{safe_name}</a>"
+                f" — <b>{count}</b> messages"
+            )
+
+    own_rank = next(
+        (i for i, row in enumerate(rows, 1) if row[0] == user_id),
+        None
+    )
+
+    own_count = next(
+        (row[2] for row in rows if row[0] == user_id),
+        0
+    )
+
+    lines.append("━━━━━━━━━━━━━━")
+    if own_rank:
+        lines.append(
+            f"📍 Your Rank: <b>#{own_rank}</b>\n"
+            f"💬 Your Messages: <b>{own_count}</b>"
+        )
+    else:
+        lines.append("📍 Your Rank: Not ranked yet. Group mein message bhejo!")
+
+    if kind == "daily":
+        lines.append("🔄 Reset: Daily at 12 AM IST")
+    elif kind == "weekly":
+        lines.append("🔄 Reset: Every Monday at 12 AM IST")
+    else:
+        lines.append("♾️ Lifetime ranking — never resets")
+
+    return "\n".join(lines)
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    msg = update.effective_message
+
+    if chat.type in ("group", "supergroup"):
+        register_group(chat.id, chat.title)
+        await msg.reply_text(
+            "🤖 <b>CHAT MANAGER</b>\n\n"
+            "Ranking system active!\n"
+            "Daily, Weekly aur Overall ranking dekh sakte ho.",
+            parse_mode="HTML",
+            reply_markup=keyboard()
+        )
+        return
+
+    groups = active_groups()
+
+    await msg.reply_text(
+        "👋 <b>Welcome to Chat Manager!</b>\n\n"
+        "Niche ke buttons se ranking choose karo.",
+        parse_mode="HTML",
+        reply_markup=keyboard()
+    )
+
+    if groups:
+        await msg.reply_text(
+            "📍 Apna group select karo:",
+            reply_markup=group_keyboard()
+        )
+    else:
+        await msg.reply_text(
+            "Pehle bot ko apne GC mein add karo aur wahan /start bhejo."
+        )
+
+
+async def show_private_ranking(update, context, chat_id, kind):
+    user = update.effective_user
+    allowed = {gid for gid, _ in active_groups()}
+
+    if chat_id not in allowed:
+        if update.callback_query:
+            await update.callback_query.answer(
+                "Group active nahi hai.", show_alert=True
+            )
+        return
+
+    text = ranking(chat_id, kind, user.id)
+
+    buttons = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📅 Daily", callback_data=f"rank:{chat_id}:daily"),
+            InlineKeyboardButton("🗓 Weekly", callback_data=f"rank:{chat_id}:weekly"),
+            InlineKeyboardButton("👑 Overall", callback_data=f"rank:{chat_id}:overall")
+        ],
+        [InlineKeyboardButton("🔁 Change Group", callback_data="groups")]
+    ])
+
+    if update.callback_query:
+        await update.callback_query.answer()
+        await update.callback_query.edit_message_text(
+            text, parse_mode="HTML", reply_markup=buttons
+        )
+    else:
+        await context.bot.send_message(
+            chat_id=user.id, text=text,
+            parse_mode="HTML", reply_markup=buttons
+        )
+
+
+async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    data = query.data
+
+    if data == "groups":
+        await query.answer()
+        await query.edit_message_text(
+            "📍 Apna group select karo:",
+            reply_markup=group_keyboard()
+        )
+        return
+
+    if data.startswith("pick:"):
+        chat_id = int(data.split(":", 1)[1])
+        await show_private_ranking(update, context, chat_id, "daily")
+        return
+
+    if data.startswith("rank:"):
+        _, chat_id, kind = data.split(":", 2)
+        if kind in ("daily", "weekly", "overall"):
+            await show_private_ranking(update, context, int(chat_id), kind)
+
+
+async def text_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    choices = {
+        "📅 Daily Ranking": "daily",
+        "🗓 Weekly Ranking": "weekly",
+        "👑 Overall Ranking": "overall"
+    }
+
+    text = (update.effective_message.text or "").strip()
+    if text not in choices:
+        return
+
     chat = update.effective_chat
     user = update.effective_user
-    message = update.effective_message
 
-    if (
-        not chat
-        or chat.type not in ("group", "supergroup")
-        or not user
-        or user.is_bot
-        or not message
-    ):
+    if chat.type in ("group", "supergroup"):
+        register_group(chat.id, chat.title)
+        await update.effective_message.reply_text(
+            ranking(chat.id, choices[text], user.id),
+            parse_mode="HTML"
+        )
+        return
+
+    groups = active_groups()
+
+    if len(groups) == 1:
+        await show_private_ranking(
+            update, context, groups[0][0], choices[text]
+        )
+    elif groups:
+        await update.effective_message.reply_text(
+            "Pehle group select karo:",
+            reply_markup=group_keyboard()
+        )
+    else:
+        await update.effective_message.reply_text(
+            "Bot ko pehle apne group mein add karo."
+        )
+
+
+async def track_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    chat = update.effective_chat
+    user = update.effective_user
+
+    if not msg or not chat or not user or user.is_bot:
+        return
+
+    if chat.type not in ("group", "supergroup"):
+        return
+
+    if msg.text and msg.text.startswith("/"):
         return
 
     register_group(chat.id, chat.title)
 
     conn = db()
-    conn.execute(
-        """
-        INSERT INTO messages(
-            chat_id, user_id, username, first_name, ts
-        ) VALUES(?,?,?,?,?)
-        """,
-        (
-            chat.id,
-            user.id,
-            user.username or "",
-            user.first_name or "",
-            iso(local_now()),
-        ),
-    )
+    conn.execute("""
+        INSERT INTO messages(chat_id, user_id, username, first_name, ts)
+        VALUES (?, ?, ?, ?, ?)
+    """, (
+        chat.id, user.id, user.username,
+        user.first_name, iso(now())
+    ))
     conn.commit()
     conn.close()
 
 
-async def my_chat_member(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-    chat = update.effective_chat
-    change = update.my_chat_member
-
-    if (
-        not chat
-        or chat.type not in ("group", "supergroup")
-        or not change
-    ):
-        return
-
-    status = change.new_chat_member.status
-
-    if status in (
-        ChatMemberStatus.MEMBER,
-        ChatMemberStatus.ADMINISTRATOR,
-    ):
-        register_group(chat.id, chat.title)
-
-    elif status in (
-        ChatMemberStatus.LEFT,
-        ChatMemberStatus.KICKED,
-    ):
-        conn = db()
-        conn.execute(
-            "UPDATE groups SET active=0 WHERE chat_id=?",
-            (chat.id,),
-        )
-        conn.commit()
-        conn.close()
-
-
-async def start(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-    chat = update.effective_chat
-    message = update.effective_message
-
-    if chat and chat.type in ("group", "supergroup"):
-        register_group(chat.id, chat.title)
-
-        await message.reply_text(
-            "🤖 <b>CHAT MANAGER RANKING BOT</b>\n\n"
-            "✅ Activity tracking is ON!\n\n"
-            "📊 /leaderboard — Today's ranking\n"
-            "🏆 /rankings — View leaderboard\n"
-            "🆔 /myid — Your Telegram ID",
-            parse_mode="HTML",
-        )
-    else:
-        await message.reply_text(
-            "🤖 Chat Manager Ranking Bot\n\n"
-            "Mujhe apne Telegram group mein add karo, "
-            "phir group mein /start bhejo."
-        )
-
-
-async def myid(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
+async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(
-        f"🆔 Your Telegram ID: "
-        f"<code>{update.effective_user.id}</code>",
-        parse_mode="HTML",
+        f"Your Telegram ID: <code>{update.effective_user.id}</code>",
+        parse_mode="HTML"
     )
 
 
-async def rankings(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-    chat = update.effective_chat
-
-    if not chat or chat.type not in ("group", "supergroup"):
-        await update.effective_message.reply_text(
-            "Ye command group mein use karo."
-        )
-        return
-
-    now = local_now()
-    start_time = datetime.combine(
-        now.date(), time.min, tzinfo=TZ
-    )
-
-    rows = leaderboard(
-        chat.id,
-        start_time,
-        now + timedelta(seconds=1),
-        10,
-    )
-
-    if not rows:
-        await update.effective_message.reply_text(
-            "Aaj abhi ranking ke liye activity nahi mili. 🔥"
-        )
-        return
-
-    lines = ["🏆 <b>TODAY'S ACTIVITY LEADERBOARD</b>\n"]
-
-    for index, (uid, name, total) in enumerate(rows, 1):
-        lines.append(
-            f"{index}. {format_name(uid, name)} "
-            f"— <b>{total}</b> messages"
-        )
-
-    await update.effective_message.reply_text(
-        "\n".join(lines),
-        parse_mode="HTML",
-    )
-
-
-def award_already_sent(chat_id, award_type, period_key):
-    conn = db()
-
-    row = conn.execute(
-        """
-        SELECT 1 FROM awards
-        WHERE chat_id=? AND award_type=? AND period_key=?
-        """,
-        (chat_id, award_type, period_key),
-    ).fetchone()
-
-    conn.close()
-    return row is not None
-
-
-def mark_award_sent(chat_id, award_type, period_key):
-    conn = db()
-
-    conn.execute(
-        """
-        INSERT OR IGNORE INTO awards(
-            chat_id, award_type, period_key, sent_at
-        ) VALUES(?,?,?,?)
-        """,
-        (
-            chat_id,
-            award_type,
-            period_key,
-            iso(local_now()),
-        ),
-    )
-
-    conn.commit()
-    conn.close()
-
-
-async def send_award(
-    context,
-    chat_id,
-    award_type,
-    title,
-    subtitle,
-    start_time,
-    end_time,
-    emoji,
-    period_key,
-):
-    if award_already_sent(chat_id, award_type, period_key):
-        return
-
-    rows = leaderboard(
-        chat_id,
-        start_time,
-        end_time,
-        1,
-    )
-
-    if not rows:
-        return
-
-    uid, name, total = rows[0]
-    mention = format_name(uid, name)
-
-    text = (
-        "╭━━━━━━━━━━━━━━━━━━━━━━╮\n"
-        f"{emoji} <b>{title}</b> {emoji}\n"
-        "╰━━━━━━━━━━━━━━━━━━━━━━╯\n\n"
-        f"👑 Winner: {mention}\n"
-        "🏆 <b>#1 Rank</b>\n"
-        f"💬 <b>{total}</b> messages\n"
-        f"{subtitle}\n\n"
-        f"🎉 Congratulations {mention}!\n"
-        "❤️ Keep the vibes alive! 🔥"
-    )
-
-    msg = await context.bot.send_message(
-        chat_id=chat_id,
-        text=text,
-        parse_mode="HTML",
-    )
-
-    mark_award_sent(chat_id, award_type, period_key)
-
-    try:
-        await context.bot.pin_chat_message(
-            chat_id=chat_id,
-            message_id=msg.message_id,
-            disable_notification=True,
-        )
-    except Exception:
-        logger.exception(
-            "Could not pin %s award in %s",
-            award_type,
-            chat_id,
-        )
-
-
-async def daily_awards(
-    context: ContextTypes.DEFAULT_TYPE
-):
-    # Daily award at 9 PM IST uses the previous completed day.
-    now = local_now()
-
-    today_start = datetime.combine(
-        now.date(), time.min, tzinfo=TZ
-    )
-    yesterday_start = today_start - timedelta(days=1)
-    tomorrow_start = today_start + timedelta(days=1)
-
-    conn = db()
-    chats = conn.execute(
-        "SELECT chat_id FROM groups WHERE active=1"
-    ).fetchall()
-    conn.close()
-
-    for (chat_id,) in chats:
-        try:
-            # Daily winner
-            await send_award(
-                context,
-                chat_id,
-                "daily",
-                "MEMBER OF THE DAY",
-                "🔥 Most Active Member — previous day",
-                yesterday_start,
-                today_start,
-                "🌟",
-                yesterday_start.date().isoformat(),
-            )
-
-            # Weekly winner: Sunday at 9 PM IST
-            if now.weekday() == 6:
-                week_start = today_start - timedelta(days=6)
-
-                await send_award(
-                    context,
-                    chat_id,
-                    "weekly",
-                    "WEEKLY CHAMPION",
-                    "🔥 Top Active Member This Week",
-                    week_start,
-                    tomorrow_start,
-                    "🏆",
-                    f"week-{week_start.date().isoformat()}",
-                )
-
-            # Monthly winner: last day of the month
-            next_day = now.date() + timedelta(days=1)
-
-            if next_day.month != now.month:
-                month_start = datetime(
-                    now.year, now.month, 1, tzinfo=TZ
-                )
-
-                await send_award(
-                    context,
-                    chat_id,
-                    "monthly",
-                    "MONTHLY LEGEND",
-                    "💎 Top Active Member This Month",
-                    month_start,
-                    tomorrow_start,
-                    "👑",
-                    f"month-{now.year}-{now.month:02d}",
-                )
-
-        except Exception:
-            logger.exception(
-                "Award error for group %s",
-                chat_id,
-            )
-
-
-async def broadcast(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
+async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    message_obj = update.effective_message
 
-    if not OWNER_ID or not user or user.id != OWNER_ID:
-        await message_obj.reply_text("⛔ Owner only.")
+    if not OWNER_ID or user.id != OWNER_ID:
+        await update.effective_message.reply_text("⛔ Owner only.")
         return
 
     message = " ".join(context.args).strip()
-
     if not message:
-        await message_obj.reply_text(
-            "Use: /broadcast Your message here"
+        await update.effective_message.reply_text(
+            "Usage: /broadcast Your message"
         )
         return
-
-    conn = db()
-    chats = conn.execute(
-        "SELECT chat_id FROM groups WHERE active=1"
-    ).fetchall()
-    conn.close()
 
     sent = 0
     failed = 0
 
-    for (chat_id,) in chats:
+    for chat_id, _ in active_groups():
         try:
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=message,
-            )
+            await context.bot.send_message(chat_id, message)
             sent += 1
         except Exception:
             failed += 1
-            logger.exception(
-                "Broadcast failed for group %s",
-                chat_id,
-            )
-
-    await message_obj.reply_text(
-        "📢 <b>Broadcast Complete</b>\n\n"
-        f"✅ Sent: {sent}\n"
-        f"❌ Failed: {failed}",
-        parse_mode="HTML",
-    )
-
-
-async def groups(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-    user = update.effective_user
-
-    if not OWNER_ID or not user or user.id != OWNER_ID:
-        await update.effective_message.reply_text(
-            "⛔ Owner only."
-        )
-        return
-
-    conn = db()
-
-    count = conn.execute(
-        "SELECT COUNT(*) FROM groups WHERE active=1"
-    ).fetchone()[0]
-
-    conn.close()
 
     await update.effective_message.reply_text(
-        f"📊 Registered active groups: <b>{count}</b>",
-        parse_mode="HTML",
+        f"📢 Broadcast complete\n✅ Sent: {sent}\n❌ Failed: {failed}"
     )
 
 
-async def error_handler(
-    update: object,
-    context: ContextTypes.DEFAULT_TYPE
-):
-    logger.error("Bot error: %s", context.error)
+async def groups_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not OWNER_ID or update.effective_user.id != OWNER_ID:
+        await update.effective_message.reply_text("⛔ Owner only.")
+        return
+
+    await update.effective_message.reply_text(
+        f"Registered groups: {len(active_groups())}"
+    )
+
+
+async def member_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    change = update.my_chat_member
+
+    if not chat or not change:
+        return
+
+    status = change.new_chat_member.status
+
+    if status in (ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR):
+        register_group(chat.id, chat.title)
+    elif status in (ChatMemberStatus.LEFT, ChatMemberStatus.KICKED):
+        conn = db()
+        conn.execute("UPDATE groups SET active=0 WHERE chat_id=?", (chat.id,))
+        conn.commit()
+        conn.close()
+
+
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Chat Manager running")
+
+    def log_message(self, *args):
+        pass
+
+
+def start_health_server():
+    port = int(os.environ.get("PORT", "10000"))
+    server = ThreadingHTTPServer(("0.0.0.0", port), HealthHandler)
+    Thread(target=server.serve_forever, daemon=True).start()
 
 
 def main():
     conn = db()
     conn.close()
 
+    try:
+        start_health_server()
+    except Exception:
+        logger.exception("Health server failed")
+
     app = Application.builder().token(TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("leaderboard", rankings))
-    app.add_handler(CommandHandler("rankings", rankings))
     app.add_handler(CommandHandler("myid", myid))
-    app.add_handler(CommandHandler("groups", groups))
+    app.add_handler(CommandHandler("leaderboard", text_buttons))
+    app.add_handler(CommandHandler("rankings", text_buttons))
     app.add_handler(CommandHandler("broadcast", broadcast))
+    app.add_handler(CommandHandler("groups", groups_command))
 
+    app.add_handler(
+        CallbackQueryHandler(callbacks, pattern=r"^(pick:|rank:|groups$)")
+    )
+
+    app.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, text_buttons),
+        group=0
+    )
     app.add_handler(
         MessageHandler(
             filters.ChatType.GROUPS & ~filters.COMMAND,
-            track_message,
-        )
+            track_message
+        ),
+        group=1
     )
 
     app.add_handler(
-        ChatMemberHandler(
-            my_chat_member,
-            ChatMemberHandler.MY_CHAT_MEMBER,
-        )
-    )
-
-    app.add_error_handler(error_handler)
-
-    # Automatic awards every day at 9 PM India time.
-    app.job_queue.run_daily(
-        daily_awards,
-        time(hour=21, minute=0, tzinfo=TZ),
-        name="automatic_activity_awards",
-    )
-
-    logger.info(
-        "Chat Manager Ranking Bot starting. "
-        "Awards scheduled for 21:00 IST."
+        ChatMemberHandler(member_update, ChatMemberHandler.MY_CHAT_MEMBER)
     )
 
     app.run_polling(allowed_updates=Update.ALL_TYPES)
